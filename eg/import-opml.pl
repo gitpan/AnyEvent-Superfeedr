@@ -12,14 +12,22 @@ my $doc = $parser->parse_file($opml);
 my @feeds;
 $doc->walkdown(sub { push @feeds, $_[0]->xml_url if defined $_[0]->xml_url });
 
-my $superfeedr; $superfeedr = AnyEvent::Superfeedr->new(
+my $superfeedr = AnyEvent::Superfeedr->new(
     debug => $ENV{ANYEVENT_SUPERFEEDR_DEBUG},
     jid => $jid,
     password => $pass,
-    on_connect => sub {
-        $superfeedr->subscribe(@feeds, sub { warn "Subscribed to $_[0]\n" });
-    },
 );
 
-AnyEvent->condvar->recv;
+my $end = AnyEvent->condvar;
+$end->begin for @feeds;
+$superfeedr->connect( sub {
+    $superfeedr->subscribe(
+        @feeds => sub {
+            print STDERR "Subscribed to $_[0]\n";
+            $end->send;
+        }
+    );
+});
+
+$end->recv;
 

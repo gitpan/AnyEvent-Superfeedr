@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use 5.008_001;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 use Carp;
 
 use AnyEvent;
@@ -13,9 +13,12 @@ use AnyEvent::XMPP::Client;
 use AnyEvent::XMPP::Ext::Superfeedr;
 use AnyEvent::XMPP::Ext::Pubsub;
 use XML::Atom::Entry;
+use Scalar::Util();
 use URI::Escape();
 
 our $SERVICE = 'firehoser.superfeedr.com';
+
+use constant SUBSCRIBE_CHUNK_SIZE => 30;
 
 # TODO:
 # debug
@@ -28,7 +31,8 @@ sub new {
     my %param = @_;
 
     my %filtered;
-    for ( qw{jid password debug on_notification on_connect on_disconnect on_error} ) {
+    for ( qw{ jid password debug
+              on_notification on_connect on_disconnect on_error }) {
         $filtered{$_} = delete $param{$_};
     }
     croak "Unknown option(s): " . join ", ", keys %param if keys %param;
@@ -39,8 +43,17 @@ sub new {
         password => $filtered{password},
     }, ref $class || $class;
 
+    ## can be passed to connect() too
+    $superfeedr->{on_connect} = $filtered{on_connect}
+        if $filtered{on_connect};
+
     my $on_error = $filtered{on_error} || sub {
-        my $err = shift;
+        my ($cl, $acc, $err) = @_;
+        if (Scalar::Util::blessed($err)) {
+            if ($err->isa('AnyEvent::XMPP::Error')) {
+                $err = $err->string;
+            }
+        }
         warn "Error: " . $err;
     };
 
@@ -60,16 +73,20 @@ sub new {
     $cl->reg_cb(
         error => $on_error,
         connected => sub {
-            $superfeedr->{xmpp_client} = $cl;
-            $filtered{on_connect}->() if $filtered{on_connect};
+            $superfeedr->{connected} = 1;
+            $superfeedr->{on_connect}->($superfeedr)
+                if $superfeedr->{on_connect};
         },
         disconnect => sub {
-            ($filtered{on_disconnect} || sub { warn "Got disconnected from $_[1]:$_[2]" })->(@_);
+            $superfeedr->{connected} = 0;
+            (   $filtered{on_disconnect}
+             || sub { warn "Got disconnected from $_[2]:$_[3], $_[4]" }
+            )->($superfeedr, @_);
         },
         connect_error => sub {
-            my ($account, $reason) = @_;
+            my ($cl, $account, $reason) = @_;
             my $jid = $account->bare_jid;
-            $on_error->("connection error for $jid: $reason");
+            $on_error->($cl, $account, "connection error for $jid: $reason");
         },
     );
     if (my $on_notification = $filtered{on_notification} ) {
@@ -81,25 +98,38 @@ sub new {
             },
         );
     }
-    $cl->start;
-
+    $superfeedr->{xmpp_client} = $cl;
     return $superfeedr;
+}
+
+sub connect {
+    my $superfeedr = shift;
+    my $on_connect = shift;
+
+    my $cl = $superfeedr->{xmpp_client}
+        or return;
+    if ($cl->{connected}) {
+        $superfeedr->event(error => "Already connected");
+        return;
+    }
+    $superfeedr->{on_connect} = $on_connect if $on_connect;
+    $cl->start;
 }
 
 sub subscribe {
     my $superfeedr = shift;
-    $superfeedr->pubsub_method('subscribe_node', @_);
+    $superfeedr->pubsub_method('subscribe_nodes', @_);
 }
 
 sub unsubscribe {
     my $superfeedr = shift;
-    $superfeedr->pubsub_method('unsubscribe_node', @_);
+    $superfeedr->pubsub_method('unsubscribe_nodes', @_);
 }
 
 sub pubsub_method {
     my $superfeedr = shift;
     my($method, @feed_uris) = @_;
-    my $cb = ref $feed_uris[-1] eq 'CODE' ? pop : sub { };
+    my $cb = ref $feed_uris[-1] eq 'CODE' ? pop @feed_uris : sub { };
 
     my $pubsub = $superfeedr->xmpp_pubsub;
     unless ($pubsub) {
@@ -112,19 +142,35 @@ sub pubsub_method {
         return;
     }
 
-    for my $feed_uri (@feed_uris) {
-        my $res_cb = sub {
-            my $err = shift;
-            if ($err) {
-                $superfeedr->event(error => $err);
-            } else {
-                $cb->($feed_uri);
-            }
-        };
+    my @chunk = splice @feed_uris, 0, SUBSCRIBE_CHUNK_SIZE;
 
-        my $xmpp_uri = xmpp_node_uri($feed_uri);
-        $pubsub->$method($con, $xmpp_uri, $res_cb);
-    }
+    my $res_cb;
+
+    my $chunk_cb = sub {
+        my ($chunk, $res_cb) = @_;
+        my @xmpp_uris = map { xmpp_node_uri($_) } @$chunk;
+        $pubsub->$method($con, \@xmpp_uris, $res_cb);
+    };
+
+    $res_cb = sub {
+        my $err = shift;
+        if ($err) {
+            $superfeedr->event(error => $err);
+            undef @chunk;
+            undef @feed_uris;
+        } else {
+            $cb->($_) for @chunk;
+            if (@feed_uris) {
+                @chunk = splice @feed_uris, 0, SUBSCRIBE_CHUNK_SIZE;
+                $chunk_cb->(\@chunk, $res_cb);
+            }
+            else {
+                undef $chunk_cb;
+                undef $res_cb;
+            }
+        }
+    };
+    $chunk_cb->(\@chunk, $res_cb);
 }
 
 sub xmpp_node_uri {
@@ -184,17 +230,15 @@ AnyEvent::Superfeedr - XMPP interface to Superfeedr service.
       password => $password
       on_notification => $callback,
   );
-
+  $superfeedr->connect;
   AnyEvent->condvar->recv;
 
   # Subsribe upon connection
-  my $superfeedr; $superfeedr = AnyEvent::Superfeedr->new(
+  my $superfeedr = AnyEvent::Superfeedr->new(
       jid => $jid,
       password => $password,
-      on_connect => sub {
-          $superfeed->subscribe($feed_uri);
-      },
   );
+  $superfeedr->connect(sub { $superfeedr->subscribe($feed_uri) });
 
   # Periodically fetch new URLs from database and subscribe
   my $timer = AnyEvent->timer(
@@ -217,6 +261,10 @@ content.
 
 This is a first version of the api, and probably only covers specific
 architectural needs.
+
+=head1 EXAMPLES
+
+see in the eg/ directory of the distribution.
 
 =head1 AUTHOR
 
