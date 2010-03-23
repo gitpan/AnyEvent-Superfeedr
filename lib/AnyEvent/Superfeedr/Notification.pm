@@ -10,6 +10,7 @@ use Object::Tiny qw{
     next_fetch
     feed_uri
     items
+    title
     _node_entries
     _atom_entries
 };
@@ -56,18 +57,36 @@ sub as_atom_feed {
 sub as_xml {
     my $notification = shift;
     my $id = $notification->tagify;
-    my $feed_uri = $notification->feed_uri;
+    my $feed_uri = _xml_encode($notification->feed_uri);
+    my $title    = _xml_encode($notification->title);
+    my $now      = _now_as_w3c();
     my $feed = <<EOX;
 <?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://purl.org/atom/ns#">
+<feed xmlns="http://www.w3.org/2005/Atom">
 <id>$id</id>
-<link>$feed_uri</link>
+<title>$title</title>
+<updated>$now</updated>
+<link href="$feed_uri" rel="self" />
 EOX
     for my $node_entry ($notification->node_entries) {
         $feed .= $node_entry->as_string;
     }
     $feed .= "</feed>";
     return $feed;
+}
+
+sub _now_as_w3c {
+    my @time = gmtime;
+    sprintf '%4d-%02d-%02dT%02d:%02d:%02dZ',
+        $time[5]+1900, $time[4]+1, @time[3,2,1,0];
+}
+
+my %enc = ('&' => '&amp;', '"' => '&quot;', '<' => '&lt;', '>' => '&gt;', '\'' => '&#39;');
+
+sub _xml_encode {
+    local $_ = shift;
+    s/([&"\'<>])/$enc{$1}/g;
+    $_;
 }
 
 sub tagify {

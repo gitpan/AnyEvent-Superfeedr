@@ -1,8 +1,11 @@
+use strict;
 use inc::Module::Install;
 name 'AnyEvent-Superfeedr';
 all_from 'lib/AnyEvent/Superfeedr.pm';
 
-build_requires 'Test::More';
+include('ExtUtils::AutoInstall');
+no_index(directory => 't');
+
 requires 'AnyEvent';
 requires 'AnyEvent::XMPP';
 requires 'XML::Atom';
@@ -12,9 +15,9 @@ requires 'Net::SSLeay';
 requires 'Net::LibIDN';
 requires 'Scalar::Util';
 recommends 'XML::Twig';
-use_test_base;
+
+githubmeta;
+
 auto_include_deps;
 author_tests('xt');
-auto_set_repository;
-githubmeta;
 WriteAll;
